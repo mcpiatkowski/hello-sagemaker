@@ -1,6 +1,6 @@
 # Using Custom SciKit-Learn Container
 
-This guide demonstrates how to use your existing training and inference scripts with a custom SciKit-Learn container.
+This guide demonstrates how to use your existing training and inference scripts with custom SciKit-Learn containers.
 
 ## AWS SageMaker Pre-built Container
 
@@ -20,51 +20,52 @@ sklearn_estimator = SKLearn(
 
 ## Custom Container Approach
 
-For more control, you can create a custom container:
+For more control, you need to create separate containers for training and inference:
 
-### 1. Create Dockerfile
+### Training Container
+
+#### 1. Create Training Dockerfile (Dockerfile.training)
 
 ```dockerfile
 FROM python:3.8
 
-# Install dependencies
+# Install dependencies for training
 RUN pip install scikit-learn==0.23.2 pandas numpy joblib sagemaker-training
 
 # Set working directory
 WORKDIR /opt/ml/code
 
-# Copy your scripts
+# Copy your training script
 COPY train.py /opt/ml/code/train.py
-COPY inference.py /opt/ml/code/inference.py
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=TRUE
 ENV PYTHONDONTWRITEBYTECODE=TRUE
 ENV PATH="/opt/ml/code:${PATH}"
 
-# Set entrypoints for training and serving
+# Set entrypoint for training
 ENTRYPOINT ["python", "/opt/ml/code/train.py"]
 ```
 
-### 2. Build and Push Container
+#### 2. Build and Push Training Container
 
 ```bash
-# Build container
-docker build -t sagemaker-sklearn-custom .
+# Build training container
+docker build -t sagemaker-sklearn-training -f Dockerfile.training .
 
 # Tag and push to ECR
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
-docker tag sagemaker-sklearn-custom ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-custom:latest
-docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-custom:latest
+docker tag sagemaker-sklearn-training ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-training:latest
+docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-training:latest
 ```
 
-### 3. Use Custom Container with SageMaker
+#### 3. Use Training Container with SageMaker
 
 ```python
 from sagemaker.estimator import Estimator
 
-custom_estimator = Estimator(
-    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-custom:latest',
+training_estimator = Estimator(
+    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-training:latest',
     role=role,
     instance_count=1,
     instance_type='ml.m5.large',
@@ -76,10 +77,66 @@ custom_estimator = Estimator(
 )
 
 # Start training job
-custom_estimator.fit({
+training_estimator.fit({
     'train': 's3://bucket-name/data/train',
     'test': 's3://bucket-name/data/test'
 })
+```
+
+### Inference Container
+
+#### 1. Create Inference Dockerfile (Dockerfile.inference)
+
+```dockerfile
+FROM python:3.8
+
+# Install dependencies for inference
+RUN pip install scikit-learn==0.23.2 pandas numpy joblib sagemaker-inference
+
+# Set working directory
+WORKDIR /opt/program
+
+# Copy inference script
+COPY inference.py /opt/program/inference.py
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=TRUE
+ENV PYTHONDONTWRITEBYTECODE=TRUE
+ENV PATH="/opt/program:${PATH}"
+
+# Set entrypoint for serving
+ENTRYPOINT ["python", "-m", "sagemaker_inference.serving"]
+```
+
+#### 2. Build and Push Inference Container
+
+```bash
+# Build inference container
+docker build -t sagemaker-sklearn-inference -f Dockerfile.inference .
+
+# Tag and push to ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
+docker tag sagemaker-sklearn-inference ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest
+docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest
+```
+
+#### 3. Deploy Model with Inference Container
+
+```python
+from sagemaker.model import Model
+
+# Create model using the inference container
+model = Model(
+    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest',
+    model_data='s3://bucket-name/model-artifacts/model.tar.gz',  # Output from training job
+    role=role
+)
+
+# Deploy the model
+predictor = model.deploy(
+    initial_instance_count=1,
+    instance_type='ml.m5.large'
+)
 ```
 
 ## Using AWS Pre-built Container with Your Scripts
@@ -119,42 +176,7 @@ predictor = sklearn_estimator.deploy(
 
 ## Registering a Model with Custom Container
 
-### 1. Create an inference container (separate Dockerfile)
-
-```dockerfile
-FROM python:3.8
-
-# Install dependencies
-RUN pip install scikit-learn==0.23.2 pandas numpy joblib sagemaker-inference
-
-# Set working directory
-WORKDIR /opt/program
-
-# Copy inference script
-COPY inference.py /opt/program/inference.py
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=TRUE
-ENV PYTHONDONTWRITEBYTECODE=TRUE
-ENV PATH="/opt/program:${PATH}"
-
-# Set entrypoint for serving
-ENTRYPOINT ["python", "-m", "sagemaker_inference.serving"]
-```
-
-### 2. Build and push the inference container
-
-```bash
-# Build inference container
-docker build -t sagemaker-sklearn-inference -f Dockerfile.inference .
-
-# Tag and push to ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
-docker tag sagemaker-sklearn-inference ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest
-docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest
-```
-
-### 3. Register the model in Model Registry
+### 1. Register the Model in Model Registry
 
 ```python
 import boto3
@@ -335,7 +357,7 @@ python batch_inference.py \
 
 Your existing `train.py` and `inference.py` scripts should work with minimal modifications:
 
-1. Ensure your scripts use the SageMaker environment variables:
+1. Ensure your `train.py` script uses the SageMaker environment variables:
    - `SM_MODEL_DIR`: Where model should be saved
    - `SM_CHANNEL_TRAIN`: Path to training data
    - `SM_CHANNEL_TEST`: Path to test data
