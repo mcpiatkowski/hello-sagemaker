@@ -20,11 +20,13 @@ sklearn_estimator = SKLearn(
 
 ## Custom Container Approach
 
-For more control, you need to create separate containers for training and inference:
+You can use either separate containers for training and inference or a single multi-purpose container.
 
-### Training Container
+### Option 1: Separate Containers for Training and Inference
 
-#### 1. Create Training Dockerfile (Dockerfile.training)
+#### Training Container
+
+##### 1. Create Training Dockerfile (Dockerfile.training)
 
 ```dockerfile
 FROM python:3.8
@@ -47,7 +49,7 @@ ENV PATH="/opt/ml/code:${PATH}"
 ENTRYPOINT ["python", "/opt/ml/code/train.py"]
 ```
 
-#### 2. Build and Push Training Container
+##### 2. Build and Push Training Container
 
 ```bash
 # Build training container
@@ -59,33 +61,9 @@ docker tag sagemaker-sklearn-training ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
 docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-training:latest
 ```
 
-#### 3. Use Training Container with SageMaker
+#### Inference Container
 
-```python
-from sagemaker.estimator import Estimator
-
-training_estimator = Estimator(
-    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-training:latest',
-    role=role,
-    instance_count=1,
-    instance_type='ml.m5.large',
-    hyperparameters={
-        'n-estimators': 100,
-        'max-depth': 10,
-        'random-state': 42
-    }
-)
-
-# Start training job
-training_estimator.fit({
-    'train': 's3://bucket-name/data/train',
-    'test': 's3://bucket-name/data/test'
-})
-```
-
-### Inference Container
-
-#### 1. Create Inference Dockerfile (Dockerfile.inference)
+##### 1. Create Inference Dockerfile (Dockerfile.inference)
 
 ```dockerfile
 FROM python:3.8
@@ -108,7 +86,7 @@ ENV PATH="/opt/program:${PATH}"
 ENTRYPOINT ["python", "-m", "sagemaker_inference.serving"]
 ```
 
-#### 2. Build and Push Inference Container
+##### 2. Build and Push Inference Container
 
 ```bash
 # Build inference container
@@ -120,23 +98,171 @@ docker tag sagemaker-sklearn-inference ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.co
 docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest
 ```
 
-#### 3. Deploy Model with Inference Container
+### Option 2: Multi-purpose Container for Both Training and Inference
+
+#### 1. Create a Container Entry Point Script (container_entrypoint.py)
 
 ```python
+#!/usr/bin/env python
+
+import os
+import sys
+import subprocess
+
+# Determine the execution mode (training or serving)
+def is_training_mode():
+    # Check for training environment variables
+    if os.path.exists('/opt/ml/input/config/hyperparameters.json'):
+        return True
+    # Check for common training directories
+    if os.path.exists('/opt/ml/input/data'):
+        return True
+    return False
+
+if __name__ == '__main__':
+    if is_training_mode():
+        # Training mode
+        print("Running in training mode...")
+        # Execute train.py
+        subprocess.check_call([sys.executable, '/opt/ml/code/train.py'])
+    else:
+        # Inference mode
+        print("Running in inference mode...")
+        # Start the inference server
+        subprocess.check_call([sys.executable, '-m', 'sagemaker_inference.serving'])
+```
+
+#### 2. Create a Multi-purpose Dockerfile (Dockerfile.multipurpose)
+
+```dockerfile
+FROM python:3.8
+
+# Install dependencies for both training and inference
+RUN pip install scikit-learn==0.23.2 pandas numpy joblib \
+    sagemaker-training sagemaker-inference
+
+# Set working directory
+WORKDIR /opt/ml/code
+
+# Copy your scripts
+COPY train.py /opt/ml/code/train.py
+COPY inference.py /opt/ml/code/inference.py
+COPY container_entrypoint.py /opt/ml/code/container_entrypoint.py
+
+# Make entry point executable
+RUN chmod +x /opt/ml/code/container_entrypoint.py
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=TRUE
+ENV PYTHONDONTWRITEBYTECODE=TRUE
+ENV PATH="/opt/ml/code:${PATH}"
+
+# Set custom entrypoint that will decide whether to run training or inference
+ENTRYPOINT ["/opt/ml/code/container_entrypoint.py"]
+```
+
+#### 3. Build and Push Multi-purpose Container
+
+```bash
+# Build multi-purpose container
+docker build -t sagemaker-sklearn-multipurpose -f Dockerfile.multipurpose .
+
+# Tag and push to ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com
+docker tag sagemaker-sklearn-multipurpose ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-multipurpose:latest
+docker push ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-multipurpose:latest
+```
+
+#### 4. Using the Multi-purpose Container for Training
+
+```python
+from sagemaker.estimator import Estimator
+
+# Create estimator with the multi-purpose container
+estimator = Estimator(
+    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-multipurpose:latest',
+    role=role,
+    instance_count=1,
+    instance_type='ml.m5.large',
+    hyperparameters={
+        'n-estimators': 100,
+        'max-depth': 10,
+        'random-state': 42
+    }
+)
+
+# Start training job
+estimator.fit({
+    'train': 's3://bucket-name/data/train',
+    'test': 's3://bucket-name/data/test'
+})
+```
+
+#### 5. Using the Multi-purpose Container for Inference
+
+```python
+# Deploy model using the same multi-purpose container
+predictor = estimator.deploy(
+    initial_instance_count=1,
+    instance_type='ml.m5.large'
+)
+
+# Alternatively, create a model explicitly
 from sagemaker.model import Model
 
-# Create model using the inference container
 model = Model(
-    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest',
-    model_data='s3://bucket-name/model-artifacts/model.tar.gz',  # Output from training job
+    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-multipurpose:latest',
+    model_data='s3://bucket-name/model-artifacts/model.tar.gz',
     role=role
 )
 
-# Deploy the model
 predictor = model.deploy(
     initial_instance_count=1,
     instance_type='ml.m5.large'
 )
+```
+
+### Alternative Multi-purpose Container Approach
+
+An alternative approach is to use SageMaker's environment variable-based detection:
+
+#### Create a Simpler Multi-purpose Dockerfile
+
+```dockerfile
+FROM python:3.8
+
+# Install dependencies
+RUN pip install scikit-learn==0.23.2 pandas numpy joblib \
+    sagemaker-training sagemaker-inference
+
+# Create directories
+RUN mkdir -p /opt/ml/code /opt/program
+
+# Copy scripts
+COPY train.py /opt/ml/code/train.py
+COPY inference.py /opt/program/inference.py
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=TRUE
+ENV PYTHONDONTWRITEBYTECODE=TRUE
+ENV PATH="/opt/ml/code:/opt/program:${PATH}"
+
+# Create a shell script entrypoint
+RUN echo '#!/bin/bash\n\
+if [ -d "/opt/ml/input/data" ]; then\n\
+    # Training mode\n\
+    echo "Running in training mode..."\n\
+    python /opt/ml/code/train.py\n\
+else\n\
+    # Inference mode\n\
+    echo "Running in inference mode..."\n\
+    python -m sagemaker_inference.serving\n\
+fi' > /entrypoint.sh
+
+RUN chmod +x /entrypoint.sh
+
+# Set entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
 ```
 
 ## Using AWS Pre-built Container with Your Scripts
@@ -193,9 +319,9 @@ role = sagemaker.get_execution_role()
 # Model data location (S3 URI from training job)
 model_data = 's3://bucket-name/model-artifacts/model.tar.gz'
 
-# Create a model
+# Create a model (using either the dedicated inference container or multi-purpose container)
 model = Model(
-    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-inference:latest',
+    image_uri='ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/sagemaker-sklearn-multipurpose:latest',
     model_data=model_data,
     role=role,
     sagemaker_session=sagemaker_session
